@@ -43,7 +43,6 @@ response.raise_for_status()
 sp500 = pd.read_html(response.text)[0]
 
 
-# Replace ticker dots with dashes (use regex=False for literal replacement)
 sp500['Symbol'] = sp500['Symbol'].str.replace('.', '-', regex=False)
 
 
