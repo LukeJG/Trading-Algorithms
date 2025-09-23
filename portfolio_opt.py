@@ -231,6 +231,19 @@ class Clustering:
 
 
 
+class ClusterResult:
+    def __init__(self, cluster_id, portfolio_df, results):
+        self.cluster_id = cluster_id
+        self.portfolio_df = portfolio_df
+        self.results = results
+
+    def summary(self):
+        rets = self.portfolio_df["Strategy Return"]
+        np.exp(np.log1p(rets).cumsum())-1
+        return pd.DataFrame({"cluster f'{self.cluster_id}'": rets})
+
+
+
 class PortfolioOptimizer:
     def __init__(self):
         self.data_collector = DataCollector()
@@ -389,10 +402,7 @@ class PortfolioOptimizer:
 
         return portfolio_df, optimization_results
     
-    def run_optimization(self, cluster):
-        data = self.data_collector.fetch_data()
-        data = self.data_prep.calculate_features(data)
-
+    def run_optimization(self, data, cluster):
         fixed_dates, stock_price_per_month_df = self.clustering.run_clustering(data, cluster)
     
         returns_dataframe = np.log(stock_price_per_month_df['Adj Close']).diff()
@@ -402,15 +412,37 @@ class PortfolioOptimizer:
             returns_dataframe,
             fixed_dates,
             lower_bound=0.012,
-            verbose=True
+            verbose=False
         )
-        return portfolio_df, results
+        #return portfolio_df, results
+
+        #return ClusterResult(cluster, portfolio_df, results)
+        rets = portfolio_df["Strategy Return"]
+        #cum_rets = np.exp(np.log1p(rets).cumsum())-1
+        #print(pd.DataFrame({f"cluster {cluster}": cum_rets}).head(10))
+        return pd.DataFrame({f"cluster {cluster}": rets})
+    
+    def run_all_clusters(self, verbose=False):
+        data = self.data_collector.fetch_data()
+        data = self.data_prep.calculate_features(data)
+        clusters = [0,1,2,3]  
+        all_results = pd.DataFrame()
+        for c in clusters:
+            print(f"\n🚀 Running Optimization for Cluster {c}")
+            result = self.run_optimization(data, c)
+            all_results = all_results.join(result, how='outer')
+        return all_results
 
 
 
-def main(cluster=3):
+def main(run_all):
     portfolio_optimizer = PortfolioOptimizer()
-    portfolio_df, results = portfolio_optimizer.run_optimization(cluster)
+    #portfolio_df, results = portfolio_optimizer.run_optimization(cluster)
+
+    if run_all:
+        all_results = portfolio_optimizer.run_all_clusters(verbose=True)
+    
+    print(all_results.head(10))
     
     spy = yf.download(tickers='SPY',
                   start='2017-01-01',
@@ -418,7 +450,9 @@ def main(cluster=3):
 
     spy_ret = np.log(spy[['Adj Close']]).diff().dropna().rename({'Adj Close':'SPY Buy&Hold'}, axis=1).droplevel(level=1, axis=1)
 
-    portfolio_df = portfolio_df.merge(spy_ret,left_index=True,right_index=True)
+    # cluster_choice represents what the user wants to visualize
+    # cluster_choice not initialized yet
+    portfolio_df = portfolio_df[cluster_choice].merge(spy_ret,left_index=True,right_index=True)
 
     plt.style.use('ggplot')
 
@@ -432,11 +466,11 @@ def main(cluster=3):
 
     plt.ylabel('Return')
 
-    plt.show()
+    plt.show()"""
 
 
 if __name__ == "__main__":
-    main(cluster=3)
+    main(run_all=True)
 
 
 
