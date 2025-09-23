@@ -1,6 +1,8 @@
 from statsmodels.regression.rolling import RollingOLS
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from pypfopt import EfficientFrontier, expected_returns, risk_models
+from pypfopt.exceptions import OptimizationError
 import pandas_datareader.data as web
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
@@ -56,19 +58,19 @@ class DataPrep:
     def __init__(self):
         pass
     
-    def compute_bb(group, key):
+    def compute_bb(self, group, key):
         bb = ta.bbands(close = group['adj close'], length=20)
         return bb.iloc[:,key]
 
-    def compute_atr(group):
+    def compute_atr(self, group):
         atr = ta.atr(group['high'], group['low'], group['close'], length=14)
         return atr
 
-    def compute_macd(group):
+    def compute_macd(self, group):
         macd_line = ta.macd(group, length=20).iloc[:, 0]
         return macd_line
     
-    def calculate_returns(data):
+    def calculate_returns(self, data):
         outlier_cutoff = 0.005
 
         lags = [1,2,3,6,9,12]
@@ -83,7 +85,7 @@ class DataPrep:
                                     .sub(1))
         return data
     
-    def fff_betas(data):
+    def fff_betas(self, data):
         factor_data = web.DataReader('F-F_Research_Data_5_Factors_2x3',
                                'famafrench',
                                start='2010')[0].drop('RF', axis=1)
@@ -115,10 +117,10 @@ class DataPrep:
 
         data.loc[:, factors] = data.groupby('ticker', group_keys=False)[factors].apply(lambda x: x.fillna(x.mean()))
 
-        data = data.drop(['adj close','dollar_volume','bb_low', 'bb_mid', 'bb_high'], axis=1)
+        data = data.drop(['adj close','dollar_volume'], axis=1)
 
         data = data.dropna()
-        return factor_data
+        return data
 
     
     def calculate_features(self, df):
@@ -235,7 +237,7 @@ class PortfolioOptimizer:
         self.data_prep = DataPrep()
         self.clustering = Clustering()
 
-    def analyze_portfolio_weights(weights_dict, method_used, optimization_df):
+    def analyze_portfolio_weights(self, weights_dict, method_used, optimization_df):
             w = pd.Series(weights_dict).sort_values(ascending=False)
             print(f"\n📊 Portfolio Analysis (Method: {method_used})")
             print(f"Number of assets: {len(w)}")
@@ -247,11 +249,11 @@ class PortfolioOptimizer:
             print(f"Effective number of stocks: {1/np.sum(w**2):.2f}")
             print("\nTop 5 weights:")
             print(w.head(5).round(4))
-            exp_rets = expected_returns.mean_historical_return(price_data, frequency=252)
+            exp_rets = expected_returns.mean_historical_return(optimization_df, frequency=252)
             port_mu = float((w.reindex(exp_rets.index).fillna(0) * exp_rets).sum())
             print(f"\nExpected portfolio return: {port_mu:.4f}")
 
-    def optimize_weights(optimization_prices_df, lower_bound = 0, risk_free_rate=0.04, verbose=False):
+    def optimize_weights(self, optimization_prices_df, lower_bound = 0, risk_free_rate=0.04, verbose=False):
         num_assets = optimization_prices_df.shape[1]
 
         mu = expected_returns.mean_historical_return(optimization_prices_df, frequency=252) 
@@ -291,9 +293,9 @@ class PortfolioOptimizer:
         try:
             ef = EfficientFrontier(mu, cov, weight_bounds=(lower_bound, max_weight))
             ef.min_volatility()
-            w = ef.clean_weights()
+            weights = ef.clean_weights()
             if verbose: print("✅ Minimum volatility optimization successful")
-            return w, "min_volatility"
+            return weights, "min_volatility"
         except OptimizationError:
             if verbose: print("Minimum volatility failed")
 
@@ -303,9 +305,9 @@ class PortfolioOptimizer:
             relaxed_upper = min(1.0, max_weight * 1.5)
             ef = EfficientFrontier(mu, cov, weight_bounds=(relaxed_lower, relaxed_upper))
             ef.min_volatility()
-            w = ef.clean_weights()
+            weights = ef.clean_weights()
             if verbose: print("✅ Relaxed bounds minimum volatility successful")
-            return w, "min_volatility_relaxed"
+            return weights, "min_volatility_relaxed"
         except OptimizationError:
             if verbose: print("Relaxed bounds also failed")
 
@@ -316,9 +318,9 @@ class PortfolioOptimizer:
             inv_vol /= inv_vol.sum()
             inv_vol = np.clip(inv_vol, lower_bound, max_weight)
             inv_vol /= inv_vol.sum()
-            w = dict(zip(prices.columns, inv_vol))
+            weights = dict(zip(optimization_prices_df.columns, inv_vol))
             if verbose: print("✅ Risk parity (inverse volatility) successful")
-            return w, "risk_parity"
+            return weights, "risk_parity"
         except Exception:
             if verbose: print("Risk parity failed")
 
@@ -328,14 +330,14 @@ class PortfolioOptimizer:
             rw = (adj / adj.sum()).values  
             rw = np.clip(rw, lower_bound, max_weight)
             rw = rw / rw.sum()
-            w = dict(zip(prices.columns, rw))
+            weights = dict(zip(optimization_prices_df.columns, rw))
             if verbose: print("✅ Adjusted return weighting successful")
-            return w, "return_weighted"
+            return weights, "return_weighted"
         except Exception:
             if verbose: print("Return weighting failed, using equal weights")
 
         #     ---- Final fallback ----    #
-        eq = {t: 1 / num_assets for t in prices.columns}
+        eq = {t: 1 / num_assets for t in optimization_prices_df.columns}
 
         return eq, "equal_weights_final_fallback"
 
@@ -354,6 +356,10 @@ class PortfolioOptimizer:
             optimization_end   = (pd.to_datetime(start_date) - pd.DateOffset(days=1)).strftime('%Y-%m-%d')
             optimization_prices_df = adj_close_df.loc[optimization_start:optimization_end, cols]
 
+            valid_cols = optimization_prices_df.dropna(axis=1, thresh=int(len(optimization_prices_df)*0.8)).columns
+            optimization_prices_df = optimization_prices_df[valid_cols]
+            cols = valid_cols.tolist()
+
             weights_dict, method_used = self.optimize_weights(optimization_prices_df, lower_bound, verbose)
             if verbose:
                 self.analyze_portfolio_weights(weights_dict, method_used, optimization_prices_df)
@@ -367,11 +373,11 @@ class PortfolioOptimizer:
 
             weights = pd.Series(weights_dict, name='weight')
 
-            rets_curr_month = returns_dataframe.loc[start_date, cols]
+            rets_curr_month = returns_dataframe.loc[pd.to_datetime(start_date):end_date, cols]
             rets_curr_month_df = rets_curr_month.stack().to_frame('return')
             rets_curr_month_df.index.names = ['date', 'ticker']
 
-            rets_curr_month_df = rets_curr_month_df.join(weights, on='tcker').fillna({'wieght',0.0})
+            rets_curr_month_df = rets_curr_month_df.join(weights, on='ticker').fillna({'weight':0.0})
            
             rets_curr_month_df['weighted_return'] = rets_curr_month_df['return'] * rets_curr_month_df['weight']
 
@@ -379,9 +385,14 @@ class PortfolioOptimizer:
 
             portfolio_df = pd.concat([portfolio_df, daily_returns], axis=0)
         
+        portfolio_df = portfolio_df[~portfolio_df.index.duplicated(keep='first')].sort_index()
+
         return portfolio_df, optimization_results
     
     def run_optimization(self, cluster):
+        data = self.data_collector.fetch_data()
+        data = self.data_prep.calculate_features(data)
+
         fixed_dates, stock_price_per_month_df = self.clustering.run_clustering(data, cluster)
     
         returns_dataframe = np.log(stock_price_per_month_df['Adj Close']).diff()
@@ -391,22 +402,14 @@ class PortfolioOptimizer:
             returns_dataframe,
             fixed_dates,
             lower_bound=0.012,
-            verbose=False
+            verbose=True
         )
         return portfolio_df, results
 
 
 
 def main(cluster=3):
-    clustering = Clustering()
-    data_collector = DataCollector()
-    data_prep = DataPrep()
     portfolio_optimizer = PortfolioOptimizer()
-
-    data = data_collector.fetch_data()
-    data = data_prep.calculate_features(data)
-
-
     portfolio_df, results = portfolio_optimizer.run_optimization(cluster)
     
     spy = yf.download(tickers='SPY',
@@ -421,7 +424,7 @@ def main(cluster=3):
 
     portfolio_cumulative_return = np.exp(np.log1p(portfolio_df).cumsum())-1
 
-    portfolio_cumulative_return[:'2023-09-29'].plot(figsize=(16,6))
+    portfolio_cumulative_return[:'2024-09-29'].plot(figsize=(16,6))
 
     plt.title('Unsupervised Learning Trading Strategy Returns Over Time')
 
