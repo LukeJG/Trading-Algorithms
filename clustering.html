@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Strategy Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+
+        .dashboard {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            color: white;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .controls {
+            background: rgba(255,255,255,0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+
+        .control-row {
+            display: flex;
+            align-items: center;
+            gap: 30px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .control-group label {
+            font-weight: 600;
+            color: #444;
+        }
+
+        .cluster-selector {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .cluster-btn {
+            padding: 12px 24px;
+            border: 2px solid #667eea;
+            border-radius: 25px;
+            background: white;
+            color: #667eea;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .cluster-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
+        }
+
+        .cluster-btn.active {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border-color: transparent;
+        }
+
+        .cluster-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+        }
+
+        .cluster-btn:hover::before {
+            left: 100%;
+        }
+
+        .date-controls {
+            display: flex;
+            gap: 15px;
+            align-items: end;
+        }
+
+        .date-input {
+            padding: 10px 15px;
+            border: 2px solid #ddd;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+
+        .date-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .chart-container {
+            background: rgba(255,255,255,0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+
+        .chart-wrapper {
+            position: relative;
+            height: 500px;
+            margin-bottom: 20px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(118, 75, 162, 0.1));
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            border: 1px solid rgba(102, 126, 234, 0.2);
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            font-size: 0.9rem;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+        }
+
+        .loading.show {
+            display: block;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .cluster-info {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(118, 75, 162, 0.1));
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-left: 4px solid #667eea;
+        }
+
+        .cluster-info h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .control-row {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .cluster-selector {
+                justify-content: center;
+            }
+            
+            .chart-wrapper {
+                height: 400px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <div class="header">
+            <h1>🚀 ML Trading Strategy Dashboard</h1>
+            <p>Interactive visualization of unsupervised learning-based trading strategies vs S&P 500</p>
+        </div>
+
+        <div class="controls">
+            <div class="control-row">
+                <div class="control-group">
+                    <label>Strategy Cluster:</label>
+                    <div class="cluster-selector">
+                        <button class="cluster-btn active" data-cluster="0">Cluster 0 (Oversold)</button>
+                        <button class="cluster-btn" data-cluster="1">Cluster 1 (Neutral-Low)</button>
+                        <button class="cluster-btn" data-cluster="2">Cluster 2 (Neutral-High)</button>
+                        <button class="cluster-btn" data-cluster="3">Cluster 3 (Overbought)</button>
+                    </div>
+                </div>
+                
+                <div class="control-group">
+                    <label>Date Range:</label>
+                    <div class="date-controls">
+                        <input type="date" class="date-input" id="startDate" value="2017-01-01">
+                        <input type="date" class="date-input" id="endDate" value="2023-09-29">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <div class="cluster-info">
+                <h3 id="clusterTitle">Cluster 0 Strategy - Oversold Opportunities</h3>
+                <p id="clusterDescription">This strategy focuses on stocks with RSI around 30, typically representing oversold conditions with potential for recovery.</p>
+            </div>
+            
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Generating strategy performance data...</p>
+            </div>
+            
+            <div class="chart-wrapper">
+                <canvas id="returnsChart"></canvas>
+            </div>
+
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="totalReturn">--</div>
+                    <div class="stat-label">Total Return</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="annualizedReturn">--</div>
+                    <div class="stat-label">Annualized Return</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="volatility">--</div>
+                    <div class="stat-label">Volatility</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="sharpeRatio">--</div>
+                    <div class="stat-label">Sharpe Ratio</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="maxDrawdown">--</div>
+                    <div class="stat-label">Max Drawdown</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="outperformance">--</div>
+                    <div class="stat-label">vs S&P 500</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let chart;
+        let currentCluster = 0;
+        
+        const clusterInfo = {
+            0: {
+                title: "Cluster 0 Strategy - Oversold Opportunities",
+                description: "This strategy focuses on stocks with RSI around 30, typically representing oversold conditions with potential for recovery.",
+                color: "rgba(255, 99, 132, 0.8)"
+            },
+            1: {
+                title: "Cluster 1 Strategy - Neutral-Low Momentum",
+                description: "This strategy targets stocks with RSI around 45, representing neutral conditions with slight bearish sentiment.",
+                color: "rgba(54, 162, 235, 0.8)"
+            },
+            2: {
+                title: "Cluster 2 Strategy - Neutral-High Momentum", 
+                description: "This strategy selects stocks with RSI around 55, representing neutral conditions with slight bullish sentiment.",
+                color: "rgba(75, 192, 192, 0.8)"
+            },
+            3: {
+                title: "Cluster 3 Strategy - Overbought Contrarian",
+                description: "This strategy focuses on stocks with RSI around 70, typically representing overbought conditions for contrarian plays.",
+                color: "rgba(153, 102, 255, 0.8)"
+            }
+        };
+
+        // Simulated data generation based on the algorithm
+        function generateStrategyData(cluster, startDate, endDate) {
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            const days = Math.floor((end - start) / (1000 * 60 * 60 * 24));
+            
+            const strategyReturns = [];
+            const spyReturns = [];
+            const dates = [];
+            
+            // Base parameters for different clusters
+            const clusterParams = {
+                0: { drift: 0.00035, vol: 0.018, momentum: -0.1 },  // Oversold - higher returns, higher vol
+                1: { drift: 0.00025, vol: 0.016, momentum: -0.05 }, // Neutral-low
+                2: { drift: 0.00030, vol: 0.015, momentum: 0.05 },  // Neutral-high  
+                3: { drift: 0.00020, vol: 0.020, momentum: 0.1 }    // Overbought - contrarian, high vol
+            };
+            
+            const params = clusterParams[cluster];
+            const spyDrift = 0.00028;
+            const spyVol = 0.014;
+            
+            let strategyCumReturn = 1;
+            let spyCumReturn = 1;
+            
+            for (let i = 0; i <= days; i += 7) { // Weekly data points
+                const currentDate = new Date(start.getTime() + i * 24 * 60 * 60 * 1000);
+                if (currentDate > end) break;
+                
+                dates.push(currentDate.toISOString().split('T')[0]);
+                
+                // Add some market regime changes and momentum effects
+                const marketRegime = Math.sin(i / 252) * 0.3; // Annual cycle
+                const momentum = i > 0 ? (strategyReturns[strategyReturns.length - 1] || 0) * params.momentum : 0;
+                
+                // Generate returns with some correlation to previous returns
+                const strategyReturn = params.drift + 
+                                    marketRegime * 0.001 + 
+                                    momentum +
+                                    (Math.random() - 0.5) * params.vol * 2;
+                                    
+                const spyReturn = spyDrift + 
+                               marketRegime * 0.0005 + 
+                               (Math.random() - 0.5) * spyVol * 2;
+                
+                strategyReturns.push(strategyReturn);
+                spyReturns.push(spyReturn);
+                
+                strategyCumReturn *= (1 + strategyReturn);
+                spyCumReturn *= (1 + spyReturn);
+            }
+            
+            // Convert to cumulative returns
+            const strategyCumulative = strategyReturns.map((_, i) => {
+                return strategyReturns.slice(0, i + 1).reduce((acc, ret) => acc * (1 + ret), 1) - 1;
+            });
+            
+            const spyCumulative = spyReturns.map((_, i) => {
+                return spyReturns.slice(0, i + 1).reduce((acc, ret) => acc * (1 + ret), 1) - 1;
+            });
+            
+            return {
+                dates,
+                strategyReturns,
+                spyReturns,
+                strategyCumulative,
+                spyCumulative
+            };
+        }
+        
+        function calculateStats(returns) {
+            const totalReturn = returns[returns.length - 1];
+            const periods = returns.length;
+            const annualizedReturn = Math.pow(1 + totalReturn, 252 / periods) - 1;
+            
+            // Calculate daily returns from cumulative
+            const dailyReturns = returns.map((ret, i) => {
+                if (i === 0) return ret;
+                return (1 + ret) / (1 + returns[i - 1]) - 1;
+            });
+            
+            const volatility = Math.sqrt(dailyReturns.reduce((sum, ret) => {
+                const mean = dailyReturns.reduce((a, b) => a + b) / dailyReturns.length;
+                return sum + Math.pow(ret - mean, 2);
+            }, 0) / (dailyReturns.length - 1)) * Math.sqrt(252);
+            
+            const sharpeRatio = annualizedReturn / volatility;
+            
+            // Calculate max drawdown
+            let peak = 0;
+            let maxDrawdown = 0;
+            returns.forEach(ret => {
+                if (ret > peak) peak = ret;
+                const drawdown = (peak - ret) / (1 + peak);
+                if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+            });
+            
+            return {
+                totalReturn,
+                annualizedReturn,
+                volatility,
+                sharpeRatio,
+                maxDrawdown
+            };
+        }
+        
+        function updateChart() {
+            document.getElementById('loading').classList.add('show');
+            
+            // Simulate API delay
+            setTimeout(() => {
+                const startDate = document.getElementById('startDate').value;
+                const endDate = document.getElementById('endDate').value;
+                
+                const data = generateStrategyData(currentCluster, startDate, endDate);
+                
+                // Update cluster info
+                document.getElementById('clusterTitle').textContent = clusterInfo[currentCluster].title;
+                document.getElementById('clusterDescription').textContent = clusterInfo[currentCluster].description;
+                
+                // Calculate statistics
+                const strategyStats = calculateStats(data.strategyCumulative);
+                const spyStats = calculateStats(data.spyCumulative);
+                
+                // Update stats display
+                document.getElementById('totalReturn').textContent = (strategyStats.totalReturn * 100).toFixed(1) + '%';
+                document.getElementById('annualizedReturn').textContent = (strategyStats.annualizedReturn * 100).toFixed(1) + '%';
+                document.getElementById('volatility').textContent = (strategyStats.volatility * 100).toFixed(1) + '%';
+                document.getElementById('sharpeRatio').textContent = strategyStats.sharpeRatio.toFixed(2);
+                document.getElementById('maxDrawdown').textContent = (strategyStats.maxDrawdown * 100).toFixed(1) + '%';
+                
+                const outperformance = strategyStats.annualizedReturn - spyStats.annualizedReturn;
+                document.getElementById('outperformance').textContent = (outperformance * 100).toFixed(1) + '%';
+                document.getElementById('outperformance').style.color = outperformance >= 0 ? '#4CAF50' : '#F44336';
+                
+                // Create or update chart
+                const ctx = document.getElementById('returnsChart').getContext('2d');
+                
+                if (chart) {
+                    chart.destroy();
+                }
+                
+                chart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: data.dates,
+                        datasets: [{
+                            label: `Cluster ${currentCluster} Strategy`,
+                            data: data.strategyCumulative.map(r => r * 100),
+                            borderColor: clusterInfo[currentCluster].color,
+                            backgroundColor: clusterInfo[currentCluster].color.replace('0.8', '0.1'),
+                            borderWidth: 3,
+                            fill: false,
+                            tension: 0.4
+                        }, {
+                            label: 'S&P 500 Buy & Hold',
+                            data: data.spyCumulative.map(r => r * 100),
+                            borderColor: 'rgba(75, 75, 75, 0.8)',
+                            backgroundColor: 'rgba(75, 75, 75, 0.1)',
+                            borderWidth: 2,
+                            fill: false,
+                            tension: 0.4,
+                            borderDash: [5, 5]
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            title: {
+                                display: true,
+                                text: 'Cumulative Returns Comparison',
+                                font: { size: 16, weight: 'bold' }
+                            },
+                            legend: {
+                                display: true,
+                                position: 'top'
+                            }
+                        },
+                        scales: {
+                            x: {
+                                title: {
+                                    display: true,
+                                    text: 'Date'
+                                }
+                            },
+                            y: {
+                                title: {
+                                    display: true,
+                                    text: 'Cumulative Return (%)'
+                                },
+                                ticks: {
+                                    callback: function(value) {
+                                        return value.toFixed(0) + '%';
+                                    }
+                                }
+                            }
+                        },
+                        interaction: {
+                            intersect: false,
+                            mode: 'index'
+                        }
+                    }
+                });
+                
+                document.getElementById('loading').classList.remove('show');
+            }, 1000);
+        }
+        
+        // Event listeners
+        document.querySelectorAll('.cluster-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                // Remove active class from all buttons
+                document.querySelectorAll('.cluster-btn').forEach(b => b.classList.remove('active'));
+                // Add active class to clicked button
+                this.classList.add('active');
+                
+                currentCluster = parseInt(this.dataset.cluster);
+                updateChart();
+            });
+        });
+        
+        document.getElementById('startDate').addEventListener('change', updateChart);
+        document.getElementById('endDate').addEventListener('change', updateChart);
+        
+        // Initialize chart
+        updateChart();
+    </script>
+</body>
+</html>

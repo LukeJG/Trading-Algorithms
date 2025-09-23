@@ -42,7 +42,6 @@ response.raise_for_status()
 
 sp500 = pd.read_html(response.text)[0]
 
-
 sp500['Symbol'] = sp500['Symbol'].str.replace('.', '-', regex=False)
 
 
@@ -71,26 +70,34 @@ df['garman_klass_vol'] = (
 # RSI
 df['rsi'] = df.groupby('ticker')['adj close'].transform(lambda x: ta.rsi(x, length=20))
 
-df['bb_low'] = df.groupby(level=1)['adj close'].transform(lambda x: ta.bbands(close=np.log1p(x), length=20).iloc[:,0])
-                                                          
-df['bb_mid'] = df.groupby(level=1)['adj close'].transform(lambda x: ta.bbands(close=np.log1p(x), length=20).iloc[:,1])
-                                                          
-df['bb_high'] = df.groupby(level=1)['adj close'].transform(lambda x: ta.bbands(close=np.log1p(x), length=20).iloc[:,2])
+
+# Bollinger Bands
+def compute_bb(group, key):
+  bb = ta.bbands(close=group['adj close'], length=20)
+  return bb.iloc[:,key]
+
+df['bb_low'] = df.groupby('ticker', group_keys=False).apply(compute_bb, 0)
+df['bb_mid'] = df.groupby('ticker', group_keys=False).apply(compute_bb, 1)
+df['bb_high'] = df.groupby('ticker', group_keys=False).apply(compute_bb, 2)
+
+df['bb_position'] = ((df['adj close'] - df['bb_low']) / (df['bb_high'] - df['bb_low']))
 
 
 # ATR
 def compute_atr(group):
     atr = ta.atr(group['high'], group['low'], group['close'], length=14)
-    return (atr - atr.mean()) / atr.std()
+    return atr
 
 df['atr'] = df.groupby('ticker', group_keys=False).apply(compute_atr)
 
+
 # MACD
-def compute_macd(x):
-    macd_line = ta.macd(x, length=20).iloc[:, 0]
-    return (macd_line - macd_line.mean()) / macd_line.std()
+def compute_macd(group):
+    macd_line = ta.macd(group, length=20).iloc[:, 0]
+    return macd_line
 
 df['macd'] = df.groupby('ticker')['adj close'].transform(compute_macd)
+
 
 # Dollar Volume
 df['dollar_volume'] = (df['adj close'] * df['volume']) / 1e6
@@ -184,29 +191,10 @@ data = (data.join(betas.groupby('ticker').shift()))
 
 data.loc[:, factors] = data.groupby('ticker', group_keys=False)[factors].apply(lambda x: x.fillna(x.mean()))
 
-data = data.drop(['adj close','dollar_volume'], axis=1)
+data = data.drop(['adj close','dollar_volume','bb_low', 'bb_mid', 'bb_high'], axis=1)
 
 data = data.dropna()
 
-
-def scale_group(group):
-    scaler = StandardScaler()
-    numeric_cols = group.columns.difference(['cluster'])
-    group[numeric_cols] = scaler.fit_transform(group[numeric_cols])
-    return group
-
-df_scaled = data.groupby('date', group_keys=False).apply(scale_group)
-
-
-def get_initial_centroids(group, target_rsi_values):
-    # convert targets into z-scores for this month’s RSI distribution
-    rsi_mean = group['rsi'].mean()
-    rsi_std = group['rsi'].std()
-    scaled_targets = [(t - rsi_mean) / rsi_std for t in target_rsi_values]
-
-    centroids = np.zeros((len(scaled_targets), group.shape[1]))  # match feature count
-    centroids[:, group.columns.get_loc('rsi')] = scaled_targets
-    return centroids
 
 
 
@@ -276,9 +264,7 @@ data = (
 
 
 
-# Choose Cluster 
-
-filtered_df = data[data['cluster']==3].copy()  # HERE
+filtered_df = data[data['cluster']==3].copy()    # ----- Variable that user can change ----- #
 
 filtered_df = filtered_df.reset_index(level=1)
 
@@ -291,8 +277,9 @@ dates = filtered_df.index.get_level_values('date').unique().tolist()
 fixed_dates = {}
 
 for d in dates:
-    
+
     fixed_dates[d.strftime('%Y-%m-%d')] = filtered_df.xs(d, level=0).index.tolist()
+
 
 stocks = data.index.get_level_values('ticker').unique().tolist()
 
@@ -302,351 +289,287 @@ new_df = yf.download(tickers=stocks,
 
 
 
-
-returns_dataframe = np.log(new_df['Adj Close']).diff()
-
 def robust_optimize_weights(prices, lower_bound=0.0, risk_free_rate=0.04, verbose=False):
-    """
-    Robust portfolio optimization with multiple fallback strategies
-    
-    Parameters:
-    - prices: DataFrame of asset prices
-    - lower_bound: minimum weight per asset
-    - risk_free_rate: risk-free rate for Sharpe ratio
-    - verbose: print debug information
-    
-    Returns:
-    - dict: asset weights
-    - str: method used for optimization
-    """
-    
-    if len(prices) < 5:  # Need minimum data
-        if verbose:
-            print("⚠️ Insufficient data points, using equal weights")
-        return {ticker: 1 / prices.shape[1] for ticker in prices.columns}, "equal_weights_insufficient_data"
-    
     try:
-        # Calculate returns and covariance
-        returns = expected_returns.mean_historical_return(prices, frequency=252)
-        cov = risk_models.sample_cov(prices, frequency=252)
-        
+        if len(prices) < 5:
+            if verbose:
+                print("⚠️ Insufficient data points, using equal weights")
+            return {ticker: 1 / prices.shape[1] for ticker in prices.columns}, "equal_weights_insufficient_data"
+
+        # --- inputs ---
         num_assets = prices.shape[1]
-        
+
+        # Feasibility guard: sum of lower bounds must be ≤ 1
+        if lower_bound * num_assets > 1.0:
+            if verbose:
+                print(f"⚠️ Lower bound {lower_bound:.4f} infeasible for {num_assets} assets; using 0.0")
+            lower_bound = 0.0
+
+        # Expected returns & covariance (use shrinkage for stability)
+        mu = expected_returns.mean_historical_return(prices, frequency=252)
+        cov = risk_models.CovarianceShrinkage(prices).ledoit_wolf()
+
         if verbose:
-            print(f"Expected returns range: {returns.min():.4f} to {returns.max():.4f}")
+            print(f"Expected returns range: {mu.min():.4f} to {mu.max():.4f}")
             print(f"Risk-free rate: {risk_free_rate:.4f}")
-        
-        # Dynamic upper bound
-        max_weight = min(0.15, 1.0 / num_assets * 3)  # Allow slightly higher concentration
-        
-        # Strategy 1: Max Sharpe with original risk-free rate
+
+        # Dynamic cap
+        max_weight = min(0.15, 3.0 / num_assets)
+
+        # ---- Strategy 1: Max Sharpe ----
         try:
-            if max(returns) > risk_free_rate:
-                ef = EfficientFrontier(
-                    expected_returns=returns,
-                    cov_matrix=cov,
-                    weight_bounds=(lower_bound, max_weight),
-                    solver='ECOS'  # Try ECOS first, often more reliable
-                )
-                ef.max_sharpe(risk_free_rate=risk_free_rate)
-                weights = ef.clean_weights()
-                if verbose:
-                    print("✅ Max Sharpe optimization successful")
-                return weights, "max_sharpe"
+            if mu.max() > risk_free_rate:
+                ef = EfficientFrontier(mu, cov, weight_bounds=(lower_bound, max_weight))
+                ef.max_sharpe(risk_free_rate=risk_free_rate)  # don't pass solver here
+                w = ef.clean_weights()
+                if verbose: print("✅ Max Sharpe optimization successful")
+                return w, "max_sharpe"
             else:
                 raise ValueError("No assets exceed risk-free rate")
-                
         except (OptimizationError, ValueError) as e:
-            if verbose:
-                print(f"Max Sharpe failed: {e}")
-            
-            # Strategy 2: Lower risk-free rate
-            try:
-                lower_rf = min(risk_free_rate * 0.5, max(returns) * 0.8)
-                if max(returns) > lower_rf:
-                    ef = EfficientFrontier(
-                        expected_returns=returns,
-                        cov_matrix=cov,
-                        weight_bounds=(lower_bound, max_weight),
-                        solver='ECOS'
-                    )
-                    ef.max_sharpe(risk_free_rate=lower_rf)
-                    weights = ef.clean_weights()
-                    if verbose:
-                        print(f"✅ Max Sharpe with reduced risk-free rate ({lower_rf:.4f}) successful")
-                    return weights, "max_sharpe_reduced_rf"
-                else:
-                    raise ValueError("Still no assets exceed reduced risk-free rate")
-                    
-            except (OptimizationError, ValueError):
-                if verbose:
-                    print("Reduced risk-free rate also failed")
-                
-                # Strategy 3: Minimum Volatility
-                try:
-                    ef = EfficientFrontier(
-                        expected_returns=returns,
-                        cov_matrix=cov,
-                        weight_bounds=(lower_bound, max_weight),
-                        solver='ECOS'
-                    )
-                    ef.min_volatility()
-                    weights = ef.clean_weights()
-                    if verbose:
-                        print("✅ Minimum volatility optimization successful")
-                    return weights, "min_volatility"
-                    
-                except OptimizationError:
-                    if verbose:
-                        print("Minimum volatility failed")
-                    
-                    # Strategy 4: Relaxed bounds
-                    try:
-                        relaxed_lower = max(0.0, lower_bound * 0.5)
-                        relaxed_upper = min(1.0, max_weight * 1.5)
-                        
-                        ef = EfficientFrontier(
-                            expected_returns=returns,
-                            cov_matrix=cov,
-                            weight_bounds=(relaxed_lower, relaxed_upper),
-                            solver='SCS'  # Try different solver
-                        )
-                        ef.min_volatility()
-                        weights = ef.clean_weights()
-                        if verbose:
-                            print("✅ Relaxed bounds minimum volatility successful")
-                        return weights, "min_volatility_relaxed"
-                        
-                    except OptimizationError:
-                        if verbose:
-                            print("Relaxed bounds also failed")
-                        
-                        # Strategy 5: Risk parity (inverse volatility weighting)
-                        try:
-                            individual_vols = np.sqrt(np.diag(cov))
-                            inv_vol_weights = 1 / individual_vols
-                            inv_vol_weights = inv_vol_weights / inv_vol_weights.sum()
-                            
-                            # Apply bounds
-                            inv_vol_weights = np.maximum(inv_vol_weights, lower_bound)
-                            inv_vol_weights = np.minimum(inv_vol_weights, max_weight)
-                            inv_vol_weights = inv_vol_weights / inv_vol_weights.sum()  # Renormalize
-                            
-                            weights = dict(zip(prices.columns, inv_vol_weights))
-                            if verbose:
-                                print("✅ Risk parity (inverse volatility) successful")
-                            return weights, "risk_parity"
-                            
-                        except Exception:
-                            if verbose:
-                                print("Risk parity failed")
-                            
-                            # Strategy 6: Return-weighted (avoid negative returns)
-                            try:
-                                # Shift returns to be positive
-                                adjusted_returns = returns - returns.min() + 0.01
-                                return_weights = adjusted_returns / adjusted_returns.sum()
-                                
-                                # Apply bounds
-                                return_weights = np.maximum(return_weights, lower_bound)
-                                return_weights = np.minimum(return_weights, max_weight)
-                                return_weights = return_weights / return_weights.sum()
-                                
-                                weights = dict(zip(prices.columns, return_weights))
-                                if verbose:
-                                    print("✅ Adjusted return weighting successful")
-                                return weights, "return_weighted"
-                                
-                            except Exception:
-                                if verbose:
-                                    print("Return weighting failed, using equal weights")
-                                
-                                # Final fallback: Equal weights
-                                equal_weights = {ticker: 1 / prices.shape[1] for ticker in prices.columns}
-                                return equal_weights, "equal_weights_final_fallback"
-    
+            if verbose: print(f"Max Sharpe failed: {e}")
+
+        # ---- Strategy 2: Max Sharpe with reduced RF ----
+        try:
+            lower_rf = min(risk_free_rate * 0.5, float(mu.max()) * 0.8)
+            if mu.max() > lower_rf:
+                ef = EfficientFrontier(mu, cov, weight_bounds=(lower_bound, max_weight))
+                ef.max_sharpe(risk_free_rate=lower_rf)
+                w = ef.clean_weights()
+                if verbose: print(f"✅ Max Sharpe with reduced RF ({lower_rf:.4f}) successful")
+                return w, "max_sharpe_reduced_rf"
+            else:
+                raise ValueError("Still no assets exceed reduced RF")
+        except (OptimizationError, ValueError):
+            if verbose: print("Reduced RF also failed")
+
+        # ---- Strategy 3: Min Vol ----
+        try:
+            ef = EfficientFrontier(mu, cov, weight_bounds=(lower_bound, max_weight))
+            ef.min_volatility()
+            w = ef.clean_weights()
+            if verbose: print("✅ Minimum volatility optimization successful")
+            return w, "min_volatility"
+        except OptimizationError:
+            if verbose: print("Minimum volatility failed")
+
+        # ---- Strategy 4: Relaxed bounds + Min Vol ----
+        try:
+            relaxed_lower = max(0.0, lower_bound * 0.5)
+            relaxed_upper = min(1.0, max_weight * 1.5)
+            ef = EfficientFrontier(mu, cov, weight_bounds=(relaxed_lower, relaxed_upper))
+            ef.min_volatility()
+            w = ef.clean_weights()
+            if verbose: print("✅ Relaxed bounds minimum volatility successful")
+            return w, "min_volatility_relaxed"
+        except OptimizationError:
+            if verbose: print("Relaxed bounds also failed")
+
+        # ---- Strategy 5: Risk parity (inverse vol) ----
+        try:
+            vols = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+            inv_vol = 1.0 / vols
+            inv_vol /= inv_vol.sum()
+
+            # apply bounds then renormalize
+            inv_vol = np.clip(inv_vol, lower_bound, max_weight)
+            inv_vol /= inv_vol.sum()
+            w = dict(zip(prices.columns, inv_vol))
+            if verbose: print("✅ Risk parity (inverse volatility) successful")
+            return w, "risk_parity"
+        except Exception:
+            if verbose: print("Risk parity failed")
+
+        # ---- Strategy 6: Return-weighted (shifted positive) ----
+        try:
+            # shifted positives
+            adj = mu - float(mu.min()) + 0.01
+            rw = (adj / adj.sum()).values  # numpy array
+            rw = np.clip(rw, lower_bound, max_weight)
+            rw = rw / rw.sum()
+            w = dict(zip(prices.columns, rw))
+            if verbose: print("✅ Adjusted return weighting successful")
+            return w, "return_weighted"
+        except Exception:
+            if verbose: print("Return weighting failed, using equal weights")
+
+        # ---- Final fallback ----
+        eq = {t: 1 / num_assets for t in prices.columns}
+        return eq, "equal_weights_final_fallback"
+
     except Exception as e:
         if verbose:
             print(f"Unexpected error: {e}")
-        # Ultimate fallback
-        equal_weights = {ticker: 1 / prices.shape[1] for ticker in prices.columns}
-        return equal_weights, "equal_weights_error"
+        eq = {t: 1 / prices.shape[1] for t in prices.columns}
+        return eq, "equal_weights_error"
 
-def analyze_portfolio_weights(weights_dict, method_used, returns_data=None):
+
+def analyze_portfolio_weights(weights_dict, method_used, price_data=None):
     """
-    Analyze and display portfolio weight characteristics
+    Analyze portfolio weight characteristics (optional helper)
     """
-    weights_series = pd.Series(weights_dict)
-    
+    w = pd.Series(weights_dict).sort_values(ascending=False)
     print(f"\n📊 Portfolio Analysis (Method: {method_used})")
-    print(f"Number of assets: {len(weights_series)}")
-    print(f"Weight range: {weights_series.min():.4f} to {weights_series.max():.4f}")
-    print(f"Weight concentration (max/min): {weights_series.max()/weights_series.min():.2f}")
-    print(f"Effective number of stocks: {1/np.sum(weights_series**2):.2f}")
-    
-    # Show top 5 weights
-    print(f"\nTop 5 weights:")
-    print(weights_series.nlargest(5).round(4))
-    
-    if returns_data is not None:
-        expected_returns = expected_returns.mean_historical_return(returns_data, frequency=252)
-        portfolio_return = np.sum(weights_series * expected_returns)
-        print(f"\nExpected portfolio return: {portfolio_return:.4f}")
+    print(f"Number of assets: {len(w)}")
+    w_min = float(w.min())
+    w_max = float(w.max())
+    print(f"Weight range: {w_min:.4f} to {w_max:.4f}")
+    denom = w_min if w_min > 1e-8 else 1e-8
+    print(f"Weight concentration (max/min): {w_max/denom:.2f}")
+    print(f"Effective number of stocks: {1/np.sum(w**2):.2f}")
+    print("\nTop 5 weights:")
+    print(w.head(5).round(4))
 
-# Updated main optimization function
-def optimize_weights_robust(prices, lower_bound=0.0, verbose=False):
-    """
-    Main function that calls the robust optimizer
-    """
-    weights, method = robust_optimize_weights(
-        prices=prices, 
-        lower_bound=lower_bound,
-        verbose=verbose
-    )
-    
-    if verbose:
-        analyze_portfolio_weights(weights, method, prices)
-    
-    return weights
+    if price_data is not None:
+        exp_rets = expected_returns.mean_historical_return(price_data, frequency=252)
+        port_mu = float((w.reindex(exp_rets.index).fillna(0) * exp_rets).sum())
+        print(f"\nExpected portfolio return: {port_mu:.4f}")
 
-# Your updated portfolio loop
+
 def run_portfolio_optimization(new_df, returns_dataframe, fixed_dates, lower_bound=0.012, verbose=False):
-    """
-    Run the complete portfolio optimization loop with robust error handling
-    """
     portfolio_df = pd.DataFrame()
-    optimization_results = []  # Track which method was used for each period
-    
+    optimization_results = []
+
     for i, start_date in enumerate(fixed_dates.keys()):
         if verbose:
-            print(f"\n{'='*50}")
-            print(f"Processing period {i+1}/{len(fixed_dates)}: {start_date}")
-        
+            print(f"\n{'='*50}\nProcessing period {i+1}/{len(fixed_dates)}: {start_date}")
+
         end_date = (pd.to_datetime(start_date) + pd.offsets.MonthEnd(0)).strftime('%Y-%m-%d')
         cols = fixed_dates[start_date]
-        
-        optimization_start_date = (pd.to_datetime(start_date) - pd.DateOffset(months=12)).strftime('%Y-%m-%d')
-        optimization_end_date = (pd.to_datetime(start_date) - pd.DateOffset(days=1)).strftime('%Y-%m-%d')
-        
+
+        # price panel
         adj_close_df = new_df.xs('Adj Close', axis=1, level=0)
-        optimization_df = adj_close_df.loc[optimization_start_date:optimization_end_date, cols]
-        
-        # Check data quality
-        if len(optimization_df) < 20:  # Need minimum trading days
-            print(f"⚠️ Insufficient data for {start_date}, skipping...")
+
+        # 12-month lookback (exclude current month for fit)
+        optimization_start = (pd.to_datetime(start_date) - pd.DateOffset(months=12)).strftime('%Y-%m-%d')
+        optimization_end   = (pd.to_datetime(start_date) - pd.DateOffset(days=1)).strftime('%Y-%m-%d')
+        optimization_df = adj_close_df.loc[optimization_start:optimization_end, cols]
+
+        if len(optimization_df) < 20:
+            if verbose: print(f"⚠️ Insufficient data for {start_date}, skipping...")
             continue
-            
-        # Remove any columns with insufficient data
-        valid_cols = optimization_df.dropna(axis=1, thresh=len(optimization_df)*0.8).columns
-        if len(valid_cols) < len(cols):
+
+        valid_cols = optimization_df.dropna(axis=1, thresh=int(len(optimization_df)*0.8)).columns
+        if len(valid_cols) < len(cols) and verbose:
             print(f"⚠️ Removed {len(cols) - len(valid_cols)} assets due to missing data")
-            optimization_df = optimization_df[valid_cols]
-            cols = valid_cols.tolist()
-        
-        if len(cols) == 0:
-            print(f"⚠️ No valid assets for {start_date}, skipping...")
+        optimization_df = optimization_df[valid_cols]
+        cols = valid_cols.tolist()
+        if not cols:
+            if verbose: print(f"⚠️ No valid assets for {start_date}, skipping...")
             continue
-        
-        # Get robust weights
+
+        # get weights
         weights_dict, method_used = robust_optimize_weights(
-            prices=optimization_df, 
+            prices=optimization_df,
             lower_bound=lower_bound,
             verbose=verbose
         )
-        
+        if verbose:
+            analyze_portfolio_weights(weights_dict, method_used, optimization_df)
+
         optimization_results.append({
             'date': start_date,
             'method': method_used,
             'n_assets': len(cols),
             'data_length': len(optimization_df)
         })
-        
-        # Convert weights dict to DataFrame
-        weights = pd.Series(weights_dict).to_frame('weight')
-        
-        # Slice returns for this period
+
+        # daily returns for current month
         temp_returns = returns_dataframe.loc[start_date:end_date, cols]
-        
-        # Reshape and merge returns and weights
+
         temp_df = temp_returns.stack().to_frame('return')
         temp_df.index.names = ['Date', 'Ticker']
-        
-        # Join weights
-        temp_df = temp_df.join(weights, on='Ticker')
-        temp_df['weight'] = temp_df['weight'].fillna(0)  # Handle missing weights
-        
-        # Compute weighted returns
+
+        weights = pd.Series(weights_dict, name='weight')
+        temp_df = temp_df.join(weights, on='Ticker').fillna({'weight': 0.0})
         temp_df['weighted_return'] = temp_df['return'] * temp_df['weight']
-        
-        # Sum by day to get portfolio return
+
         daily_returns = temp_df.groupby(level='Date')['weighted_return'].sum().to_frame('Strategy Return')
-        
-        # Append to full portfolio
         portfolio_df = pd.concat([portfolio_df, daily_returns], axis=0)
-    
-    # Remove duplicate index entries
-    portfolio_df = portfolio_df[~portfolio_df.index.duplicated(keep='first')]
-    
-    # Print optimization summary
-    if verbose:
-        print(f"\n{'='*50}")
-        print("OPTIMIZATION SUMMARY")
-        print(f"{'='*50}")
+
+    portfolio_df = portfolio_df[~portfolio_df.index.duplicated(keep='first')].sort_index()
+
+    if verbose and optimization_results:
+        print(f"\n{'='*50}\nOPTIMIZATION SUMMARY\n{'='*50}")
         methods_used = pd.DataFrame(optimization_results)['method'].value_counts()
         print("Methods used:")
         for method, count in methods_used.items():
             print(f"  {method}: {count} periods")
-    
+
     return portfolio_df, optimization_results
 
-def main():
-    # Usage example and plotting when run as a script
-    portfolio_df, results = run_portfolio_optimization(
-        new_df,
-        returns_dataframe,
-        fixed_dates,
-        lower_bound=0.012,
-        verbose=True,  # Set to False to reduce output
-    )
 
-    spy = yf.download(tickers='SPY', start='2017-01-01', end=dt.date.today(), auto_adjust=False)
-    # Flatten the multi-level index of spy_ret to a single level ('Date')
-    spy_ret = np.log(spy[['Adj Close']]).diff().dropna().rename({'Adj Close': 'SPY Buy&Hold'}, axis=1).droplevel(level=1, axis=1)
+returns_dataframe = np.log(new_df['Adj Close']).diff()
 
-    portfolio_df = portfolio_df.merge(spy_ret, left_index=True, right_index=True)
-
-    import matplotlib.ticker as mtick
-
-    plt.style.use('ggplot')
-
-    portfolio_cumulative_return = np.exp(np.log1p(portfolio_df).cumsum()) - 1
-
-    # Only attempt to plot if there is data
-    if portfolio_cumulative_return.empty:
-        print("No portfolio data available to plot. Check earlier processing steps.")
-        return
-
-    ax = portfolio_cumulative_return[:'2023-09-29'].plot(figsize=(16, 6))
-    ax.set_title('Unsupervised Learning Trading Strategy Returns Over Time')
-    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1))
-    ax.set_ylabel('Return')
-
-    plt.tight_layout()
-
-    # Print current backend for diagnostics
-    try:
-        backend = plt.get_backend()
-        print(f"Matplotlib backend: {backend}")
-    except Exception:
-        print("Unable to determine matplotlib backend")
-
-    # Blocking show so GUI windows stay open when available
-    try:
-        plt.show(block=True)
-        print('plt.show() returned successfully')
-    except Exception as e:
-        print(f"plt.show() failed or was suppressed: {e}")
+portfolio_df, results = run_portfolio_optimization(
+     new_df,
+     returns_dataframe,
+     fixed_dates,
+     lower_bound=0.012,
+     verbose=True  # Set to False to reduce output
+ )
 
 
-if __name__ == '__main__':
-    main()
+spy = yf.download(tickers='SPY',
+                  start='2017-01-01',
+                  end=dt.date.today(), auto_adjust=False)
+
+# Flatten the multi-level index of spy_ret to a single level ('Date')
+spy_ret = np.log(spy[['Adj Close']]).diff().dropna().rename({'Adj Close':'SPY Buy&Hold'}, axis=1).droplevel(level=1, axis=1)
+
+
+portfolio_df = portfolio_df.merge(spy_ret,
+                                  left_index=True,
+                                  right_index=True)
+
+portfolio_df
+
+
+import matplotlib.ticker as mtick
+
+plt.style.use('ggplot')
+
+portfolio_cumulative_return = np.exp(np.log1p(portfolio_df).cumsum())-1
+
+portfolio_cumulative_return[:'2023-09-29'].plot(figsize=(16,6))
+
+plt.title('Unsupervised Learning Trading Strategy Returns Over Time')
+
+plt.gca().yaxis.set_major_formatter(mtick.PercentFormatter(1))
+
+plt.ylabel('Return')
+
+plt.show()
+
+
+import matplotlib.pyplot as plt
+
+# Calculate cumulative returns
+gross_rets = (1 + portfolio_df['Strategy Return']).cumprod()
+bench_rets = (1 + portfolio_df['SPY Buy&Hold']).cumprod()
+
+# Calculate investment values starting with $1000
+initial_investment = 1000000
+rets = gross_rets * initial_investment
+b_rets = bench_rets * initial_investment
+
+# Calculate ROI
+roi = ((rets.iloc[-1] - initial_investment) / initial_investment) * 100
+b_roi = ((b_rets.iloc[-1] - initial_investment) / initial_investment) * 100
+
+# Print ROI
+print(f"Strategy ROI: {roi:.2f}%")
+print(f"Benchmark ROI: {b_roi:.2f}%")
+
+# Plot both investment values
+plt.figure(figsize=(10, 6))
+plt.plot(rets, label=f'Strategy (${roi:.2f}% ROI)', linewidth=2)
+plt.plot(b_rets, label=f'SPY Buy & Hold (${b_roi:.2f}% ROI)', linestyle='--', linewidth=2)
+
+plt.title('Value of $1000 Investment Over Time')
+plt.xlabel('Date')
+plt.ylabel('Portfolio Value ($)')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
