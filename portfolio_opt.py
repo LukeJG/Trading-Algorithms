@@ -4,6 +4,7 @@ from sklearn.cluster import KMeans
 import pandas_datareader.data as web
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+import matplotlib.ticker as mtick
 import pandas as pd
 import numpy as np
 import datetime as dt
@@ -14,13 +15,46 @@ import requests
 warnings.filterwarnings('ignore')
 
 
+class DataCollector:
+    def __init__(self):
+        pass
 
+    def fetch_data(self):
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36'
+        }
+
+        response = requests.get(url, headers=headers)
+
+        response.raise_for_status()
+
+        sp500 = pd.read_html(response.text)[0]
+
+
+        sp500['Symbol'] = sp500['Symbol'].str.replace('.', '-')
+
+
+        symbol_list = sp500['Symbol'].unique().tolist()
+
+
+        end_date = '2025-09-16'
+        start_date = pd.to_datetime(end_date) - pd.DateOffset(years=10)
+
+        df = yf.download(tickers=symbol_list,
+                        start=start_date,
+                        end=end_date, auto_adjust=False).stack()
+
+        df.index.names = ['date', 'ticker']
+        df.columns = df.columns.str.lower()
+        return df
 
 
 
 class DataPrep:
     def __init__(self):
-        return self
+        pass
     
     def compute_bb(group, key):
         bb = ta.bbands(close = group['adj close'], length=20)
@@ -62,6 +96,30 @@ class DataPrep:
 
         factor_data = factor_data.join(data['return_1m']).sort_index()
 
+        observations = factor_data.groupby('ticker').size()
+
+        valid_stocks = observations[observations >= 10]
+
+        factor_data = factor_data[factor_data.index.get_level_values('ticker').isin(valid_stocks.index)]
+
+        betas = (factor_data.groupby('ticker', group_keys=False)
+                    .apply(lambda x: RollingOLS(endog=x['return_1m'],
+                                                exog=sm.add_constant(x.drop('return_1m', axis=1)),
+                                                window=min(24, x.shape[0]),
+                                                min_nobs=len(x.columns)+1)
+                    .fit(params_only=True)
+                    .params.drop('const', axis=1)))
+        factors = ['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA']
+
+        data = (data.join(betas.groupby('ticker').shift()))
+
+        data.loc[:, factors] = data.groupby('ticker', group_keys=False)[factors].apply(lambda x: x.fillna(x.mean()))
+
+        data = data.drop(['adj close','dollar_volume','bb_low', 'bb_mid', 'bb_high'], axis=1)
+
+        data = data.dropna()
+        return factor_data
+
     
     def calculate_features(self, df):
         df['garman_klass_vol'] = (
@@ -92,23 +150,90 @@ class DataPrep:
 
         data = data.groupby('ticker', group_keys=False).apply(self.calculate_returns).dropna()
 
+        data = self.fff_betas(data)
+
         return data
     
 
-    def func(self, df):
-        last_cols = [c for c in df.columns.unique(0) if c not in ['dollar_volume', 'volume', 'open',
-                                                          'high', 'low', 'close']]
 
-        data = (pd.concat([df.unstack('ticker')['dollar_volume'].resample('M').mean().stack('ticker').to_frame('dollar_volume'),
-                        df.unstack()[last_cols].resample('M').last().stack('ticker')],axis=1)).dropna()
+class Clustering:
+    def __init__(self):
+        pass
 
+    def get_clusters(self, month_df: pd.DataFrame):
+        TARGET_RSI_RAW = [30, 45, 55, 70] 
+        numeric_cols = month_df.select_dtypes(include=[np.number]).columns.tolist()
+
+        X = month_df[numeric_cols].copy()
+
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(
+            scaler.fit_transform(X),
+            index=X.index,
+            columns=numeric_cols
+        )
+
+        rsi_idx = numeric_cols.index('rsi')
+        rsi_mean = scaler.mean_[rsi_idx]
+        rsi_std  = scaler.scale_[rsi_idx]
+
+        if np.isclose(rsi_std, 0.0):
+            # degenerate case: no dispersion in RSI this month
+            rsi_targets_z = [0.0] * len(TARGET_RSI_RAW)
+        else:
+            rsi_targets_z = [(t - rsi_mean) / rsi_std for t in TARGET_RSI_RAW]
+
+
+        n_features = len(numeric_cols)
+        initial_centroids = np.zeros((len(rsi_targets_z), n_features))
+        initial_centroids[:, rsi_idx] = rsi_targets_z
+
+        km = KMeans(
+            n_clusters=len(TARGET_RSI_RAW),
+            init=initial_centroids,
+            n_init=1,            
+            random_state=0
+        )
+        labels = km.fit_predict(X_scaled)
+
+        output = month_df.copy()
+        output['cluster'] = labels
+        return output
     
-    def 
+    def run_clustering(self, data, cluster):
+        data = (data.dropna().groupby('date', group_keys=False).apply(self.get_clusters))
+
+        filtered_df = data[data['cluster']==cluster].copy()
+
+        filtered_df = filtered_df.reset_index(level=1)
+
+        filtered_df.index = filtered_df.index+pd.DateOffset(1)
+
+        filtered_df = filtered_df.reset_index().set_index(['date', 'ticker'])
+
+        dates = filtered_df.index.get_level_values('date').unique().tolist()
+
+        fixed_dates = {}
+
+        for d in dates:
+
+            fixed_dates[d.strftime('%Y-%m-%d')] = filtered_df.xs(d, level=0).index.tolist()
+
+        stocks = data.index.get_level_values('ticker').unique().tolist()
+
+        stock_price_per_month_df = yf.download(tickers=stocks,
+                            start=data.index.get_level_values('date').unique()[0]-pd.DateOffset(months=12),
+                            end=data.index.get_level_values('date').unique()[-1], auto_adjust=False)
+
+        return fixed_dates, stock_price_per_month_df
+
 
 
 class PortfolioOptimizer:
     def __init__(self):
-        return self
+        self.data_collector = DataCollector()
+        self.data_prep = DataPrep()
+        self.clustering = Clustering()
 
     def analyze_portfolio_weights(weights_dict, method_used, optimization_df):
             w = pd.Series(weights_dict).sort_values(ascending=False)
@@ -214,9 +339,7 @@ class PortfolioOptimizer:
 
         return eq, "equal_weights_final_fallback"
 
-        
-
-    def run_portfolio_optimization(self, stock_price_per_month_df, returns_dataframe, fixed_dates, lower_bound=0.012, verbose=False):
+    def portfolio_optimization(self, stock_price_per_month_df, returns_dataframe, fixed_dates, lower_bound=0.012, verbose=False):
         portfolio_df = pd.DataFrame()
         optimization_results = []
 
@@ -248,7 +371,7 @@ class PortfolioOptimizer:
             rets_curr_month_df = rets_curr_month.stack().to_frame('return')
             rets_curr_month_df.index.names = ['date', 'ticker']
 
-            rets_curr_month_df = rets_curr_month_df.join(weights, on='tcker').fillna(['wieght':0.0])
+            rets_curr_month_df = rets_curr_month_df.join(weights, on='tcker').fillna({'wieght',0.0})
            
             rets_curr_month_df['weighted_return'] = rets_curr_month_df['return'] * rets_curr_month_df['weight']
 
@@ -257,10 +380,60 @@ class PortfolioOptimizer:
             portfolio_df = pd.concat([portfolio_df, daily_returns], axis=0)
         
         return portfolio_df, optimization_results
+    
+    def run_optimization(self, cluster):
+        fixed_dates, stock_price_per_month_df = self.clustering.run_clustering(data, cluster)
+    
+        returns_dataframe = np.log(stock_price_per_month_df['Adj Close']).diff()
+
+        portfolio_df, results = self.portfolio_optimization(
+            stock_price_per_month_df,
+            returns_dataframe,
+            fixed_dates,
+            lower_bound=0.012,
+            verbose=False
+        )
+        return portfolio_df, results
 
 
 
+def main(cluster=3):
+    clustering = Clustering()
+    data_collector = DataCollector()
+    data_prep = DataPrep()
+    portfolio_optimizer = PortfolioOptimizer()
+
+    data = data_collector.fetch_data()
+    data = data_prep.calculate_features(data)
 
 
-def main():
-    pass
+    portfolio_df, results = portfolio_optimizer.run_optimization(cluster)
+    
+    spy = yf.download(tickers='SPY',
+                  start='2017-01-01',
+                  end=dt.date.today(), auto_adjust=False)
+
+    spy_ret = np.log(spy[['Adj Close']]).diff().dropna().rename({'Adj Close':'SPY Buy&Hold'}, axis=1).droplevel(level=1, axis=1)
+
+    portfolio_df = portfolio_df.merge(spy_ret,left_index=True,right_index=True)
+
+    plt.style.use('ggplot')
+
+    portfolio_cumulative_return = np.exp(np.log1p(portfolio_df).cumsum())-1
+
+    portfolio_cumulative_return[:'2023-09-29'].plot(figsize=(16,6))
+
+    plt.title('Unsupervised Learning Trading Strategy Returns Over Time')
+
+    plt.gca().yaxis.set_major_formatter(mtick.PercentFormatter(1))
+
+    plt.ylabel('Return')
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main(cluster=3)
+
+
+
